@@ -57,6 +57,17 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 })
+
+
+//backend error from the render
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "WatchParty API is running",
+  });
+});
+
 app.use('/api/auth/login', authLimiter)
 app.use('/api/auth/register', authLimiter)
 
