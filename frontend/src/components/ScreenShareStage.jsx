@@ -1,24 +1,68 @@
-import { useEffect, useRef } from 'react'
+
+import { useEffect, useRef, useState } from 'react'
 import { MonitorUp } from 'lucide-react'
 
-export default function ScreenShareStage({ stream, sharerName, compact = false, onPlaybackError }) {
+export default function ScreenShareStage({
+  stream,
+  sharerName,
+  compact = false,
+  onPlaybackError,
+}) {
   const videoRef = useRef(null)
+  const [trackInfo, setTrackInfo] = useState('Waiting for video track')
 
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !stream) return
+
+    if (!video || !stream) {
+      setTrackInfo('No stream received')
+      return
+    }
 
     let cancelled = false
+    const tracks = stream.getVideoTracks()
+
+    const updateStatus = () => {
+      if (cancelled) return
+
+      const currentTracks = stream.getVideoTracks()
+      setTrackInfo(
+        currentTracks.length === 0
+          ? 'No video track'
+          : currentTracks
+              .map((track) => `${track.readyState}, muted=${track.muted}`)
+              .join(' | ')
+      )
+    }
+
     video.srcObject = stream
+    updateStatus()
+
+    stream.getTracks().forEach((track) => {
+      track.addEventListener('unmute', updateStatus)
+      track.addEventListener('mute', updateStatus)
+      track.addEventListener('ended', updateStatus)
+    })
+
     video.play().catch((error) => {
-      if (!cancelled) onPlaybackError(error)
+      if (!cancelled) {
+        console.error('Screen-share playback failed:', error)
+        onPlaybackError?.(error)
+      }
     })
 
     return () => {
       cancelled = true
+
+      stream.getTracks().forEach((track) => {
+        track.removeEventListener('unmute', updateStatus)
+        track.removeEventListener('mute', updateStatus)
+        track.removeEventListener('ended', updateStatus)
+      })
+
       if (video.srcObject === stream) video.srcObject = null
     }
-  }, [onPlaybackError, stream])
+  }, [stream, onPlaybackError])
 
   return (
     <section
@@ -35,11 +79,13 @@ export default function ScreenShareStage({ stream, sharerName, compact = false, 
           playsInline
           className="absolute inset-0 h-full w-full object-contain"
         />
-        <div className={`absolute left-3 top-3 flex items-center gap-2 rounded-full bg-black/70 ${
-          compact ? 'px-2 py-1 text-xs' : 'px-3 py-1.5 text-sm'
-        }`}>
-          <MonitorUp size={compact ? 14 : 16} className="shrink-0 text-indigo-300" />
-          <span>{sharerName} is sharing their screen</span>
+
+        <div className="absolute left-3 top-3 rounded-lg bg-black/80 px-3 py-2 text-xs text-white">
+          <div className="flex items-center gap-2">
+            <MonitorUp size={14} />
+            {sharerName} is sharing their screen
+          </div>
+          <div className="mt-1">{trackInfo}</div>
         </div>
       </div>
     </section>
