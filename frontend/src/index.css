@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #0a0d18;
+  --color-ink-900: #0f1324;
+  --color-ink-800: #161b33;
+  --color-ink-700: #1f2542;
+  --color-ink-600: #2b3260;
+}
+
+body {
+  background-color: var(--color-ink-950);
+  color: #e2e8f0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* thin dark scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
