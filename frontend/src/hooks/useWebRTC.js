@@ -1,3 +1,4 @@
+
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { socket } from '../services/socket'
 
@@ -5,135 +6,303 @@ function queuePeerOperation(peer, operation) {
   peer.signalQueue = peer.signalQueue
     .then(operation)
     .catch((error) => {
-      console.error(`WebRTC signaling error for ${peer.userId}:`, error)
+      console.error(`[WebRTC ${peer.userId}] Signaling error:`, error)
     })
+
+  return peer.signalQueue
 }
 
 async function applyPendingCandidates(peer) {
+  if (!peer.connection.remoteDescription) return
+
   for (const candidate of peer.pendingCandidates.splice(0)) {
     try {
       await peer.connection.addIceCandidate(candidate)
     } catch (error) {
-      console.error(`Could not apply ICE candidate from ${peer.userId}:`, error)
+      console.error(
+        `[WebRTC ${peer.userId}] ICE candidate error:`,
+        error
+      )
     }
   }
 }
 
-export function useWebRTC({ roomId, userId, participants, localStream, localScreenStream }) {
+function getLiveTrack(stream, kind) {
+  return (
+    stream?.getTracks().find(
+      (track) =>
+        track.kind === kind && track.readyState === 'live'
+    ) || null
+  )
+}
+
+function syncPeerTracks(peer, cameraStream, screenStream) {
+  const cameraTrack = getLiveTrack(cameraStream, 'video')
+  const audioTrack = getLiveTrack(cameraStream, 'audio')
+  const screenTrack = getLiveTrack(screenStream, 'video')
+
+  peer.trackUpdate = (peer.trackUpdate || Promise.resolve())
+    .then(async () => {
+      if (peer.connection.signalingState === 'closed') return
+
+      await Promise.all([
+        peer.cameraSender.replaceTrack(cameraTrack),
+        peer.audioSender.replaceTrack(audioTrack),
+        peer.screenSender.replaceTrack(screenTrack),
+      ])
+    })
+    .catch((error) => {
+      console.error(
+        `[WebRTC ${peer.userId}] Track update failed:`,
+        error
+      )
+    })
+
+  return peer.trackUpdate
+}
+
+export function useWebRTC({
+  roomId,
+  userId,
+  participants = [],
+  localStream,
+  localScreenStream,
+}) {
   const [remoteCameraStreams, setRemoteCameraStreams] = useState({})
   const [remoteScreenStreams, setRemoteScreenStreams] = useState({})
+  const [remoteAudioStreams, setRemoteAudioStreams] = useState({})
   const [connectionError, setConnectionError] = useState('')
   const [connectionVersion, setConnectionVersion] = useState(0)
+
   const peersRef = useRef(new Map())
   const localStreamRef = useRef(localStream)
   const localScreenStreamRef = useRef(localScreenStream)
 
+  // Keep the latest local streams available to every peer.
   useEffect(() => {
     localStreamRef.current = localStream
     localScreenStreamRef.current = localScreenStream
-  }, [localScreenStream, localStream])
+
+    for (const peer of peersRef.current.values()) {
+      void syncPeerTracks(peer, localStream, localScreenStream)
+    }
+  }, [localStream, localScreenStream])
 
   const updateRemoteStream = useCallback((peerId, kind, stream) => {
-    const setStreams = kind === 'screen' ? setRemoteScreenStreams : setRemoteCameraStreams
-    setStreams((current) => {
+    const setters = {
+      camera: setRemoteCameraStreams,
+      screen: setRemoteScreenStreams,
+      audio: setRemoteAudioStreams,
+    }
+
+    const setter = setters[kind]
+    if (!setter) return
+
+    setter((current) => {
       if (!stream) {
-        if (!current[peerId]) return current
+        if (!(peerId in current)) return current
+
         const next = { ...current }
         delete next[peerId]
         return next
       }
+
+      if (current[peerId] === stream) return current
+
       return { ...current, [peerId]: stream }
     })
   }, [])
 
-  const closePeer = useCallback((peerId) => {
-    const peer = peersRef.current.get(peerId)
-    if (!peer) return
+  const closePeer = useCallback(
+    (peerId) => {
+      const peer = peersRef.current.get(peerId)
+      if (!peer) return
 
-    peer.connection.onicecandidate = null
-    peer.connection.ontrack = null
-    peer.connection.onconnectionstatechange = null
-    peer.connection.oniceconnectionstatechange = null
-    for (const { track, type, listener } of peer.remoteTrackHandlers) {
-      track.removeEventListener(type, listener)
-    }
-    peer.connection.close()
-    peersRef.current.delete(peerId)
-    updateRemoteStream(peerId, 'camera', null)
-    updateRemoteStream(peerId, 'screen', null)
-  }, [updateRemoteStream])
+      // Remove it first so old track callbacks cannot update the UI.
+      peersRef.current.delete(peerId)
+
+      peer.connection.onicecandidate = null
+      peer.connection.ontrack = null
+      peer.connection.onconnectionstatechange = null
+      peer.connection.oniceconnectionstatechange = null
+
+      for (const { track, type, listener } of peer.remoteTrackHandlers) {
+        track.removeEventListener(type, listener)
+      }
+
+      peer.connection.close()
+
+      updateRemoteStream(peerId, 'camera', null)
+      updateRemoteStream(peerId, 'screen', null)
+      updateRemoteStream(peerId, 'audio', null)
+    },
+    [updateRemoteStream]
+  )
 
   const ensurePeer = useCallback(
     (peerId) => {
       const existing = peersRef.current.get(peerId)
       if (existing) return existing
 
+      console.info(`[WebRTC ${peerId}] Creating peer connection`)
+
       const connection = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+        ],
       })
-      const stream = localStreamRef.current
-      const videoTrack = stream?.getVideoTracks().find((track) => track.readyState === 'live')
-      const cameraSender = videoTrack
-        ? connection.addTrack(videoTrack, stream)
-        : connection.addTransceiver('video', { direction: 'sendrecv' }).sender
-      const screenStream = localScreenStreamRef.current
-      const screenTrack = screenStream?.getVideoTracks().find((track) => track.readyState === 'live')
-      const screenTransceiver = screenTrack
-        ? connection.addTransceiver(screenTrack, { streams: [screenStream] })
-        : connection.addTransceiver('video', { direction: 'sendrecv' })
+
+      const initialCameraTrack = getLiveTrack(
+        localStreamRef.current,
+        'video'
+      )
+
+      const cameraSender = initialCameraTrack
+        ? connection.addTrack(
+            initialCameraTrack,
+            localStreamRef.current
+          )
+        : connection.addTransceiver('video', {
+            direction: 'sendrecv',
+          }).sender
+
+      // Reserve an audio sender even when the microphone is not ready yet.
+      const audioSender = connection.addTransceiver('audio', {
+        direction: 'sendrecv',
+      }).sender
+
+      const initialScreenTrack = getLiveTrack(
+        localScreenStreamRef.current,
+        'video'
+      )
+
+      const screenTransceiver = initialScreenTrack
+        ? connection.addTransceiver(initialScreenTrack, {
+            streams: [localScreenStreamRef.current],
+          })
+        : connection.addTransceiver('video', {
+            direction: 'sendrecv',
+          })
 
       const peer = {
         userId: peerId,
         connection,
         cameraSender,
+        audioSender,
         screenSender: screenTransceiver.sender,
         screenTransceiver,
         pendingCandidates: [],
         signalQueue: Promise.resolve(),
+        trackUpdate: Promise.resolve(),
         offerStarted: false,
         remoteTrackHandlers: [],
       }
+
       peersRef.current.set(peerId, peer)
 
+      // Attach the latest camera, microphone and screen tracks.
+      void syncPeerTracks(
+        peer,
+        localStreamRef.current,
+        localScreenStreamRef.current
+      )
+
       connection.onicecandidate = ({ candidate }) => {
-        if (candidate && socket.connected) {
-          socket.emit('webrtc-ice-candidate', {
-            roomId,
-            targetUserId: peerId,
-            candidate: candidate.toJSON(),
-          })
-        }
+        if (!candidate || !socket.connected) return
+
+        socket.emit('webrtc-ice-candidate', {
+          roomId,
+          targetUserId: peerId,
+          candidate: candidate.toJSON(),
+        })
       }
 
       connection.ontrack = (event) => {
-        const kind = event.transceiver === peer.screenTransceiver ? 'screen' : 'camera'
-        const remoteStream = event.streams[0] || new MediaStream([event.track])
-        const showRemoteStream = () => {
-          if (peersRef.current.get(peerId) === peer) {
-            updateRemoteStream(peerId, kind, remoteStream)
-          }
+        if (peersRef.current.get(peerId) !== peer) return
+
+        let kind
+
+        if (event.track.kind === 'audio') {
+          kind = 'audio'
+        } else if (event.transceiver === peer.screenTransceiver) {
+          kind = 'screen'
+        } else {
+          kind = 'camera'
         }
-        const hideRemoteStream = () => {
+
+        // Keep audio separate so WatchRoom can play it with an audio element.
+        const remoteStream =
+          kind === 'audio'
+            ? new MediaStream([event.track])
+            : event.streams?.[0] ||
+              new MediaStream([event.track])
+
+        const showStream = () => {
+          if (peersRef.current.get(peerId) !== peer) return
+
+          updateRemoteStream(peerId, kind, remoteStream)
+        }
+
+        const hideStream = () => {
+          if (peersRef.current.get(peerId) !== peer) return
+
           updateRemoteStream(peerId, kind, null)
         }
-        for (const type of ['mute', 'unmute', 'ended']) {
-          const listener = type === 'unmute' ? showRemoteStream : hideRemoteStream
-          event.track.addEventListener(type, listener)
-          peer.remoteTrackHandlers.push({ track: event.track, type, listener })
+
+        const onMute = () => {
+          console.info(`[WebRTC ${peerId}] ${kind} track muted`)
         }
-        showRemoteStream()
+
+        const onUnmute = () => {
+          showStream()
+          console.info(`[WebRTC ${peerId}] ${kind} track unmuted`)
+        }
+
+        const onEnded = () => {
+          hideStream()
+          console.info(`[WebRTC ${peerId}] ${kind} track ended`)
+        }
+
+        for (const [type, listener] of [
+          ['mute', onMute],
+          ['unmute', onUnmute],
+          ['ended', onEnded],
+        ]) {
+          event.track.addEventListener(type, listener)
+          peer.remoteTrackHandlers.push({
+            track: event.track,
+            type,
+            listener,
+          })
+        }
+
+        showStream()
+
+        console.info(`[WebRTC ${peerId}] Received ${kind} track`, {
+          trackKind: event.track.kind,
+          readyState: event.track.readyState,
+          muted: event.track.muted,
+          streamCount: event.streams?.length ?? 0,
+        })
       }
 
       const logConnectionState = () => {
         console.info(
           `[WebRTC ${peerId}] connectionState=${connection.connectionState}, iceConnectionState=${connection.iceConnectionState}`
         )
-        if (connection.connectionState === 'failed' || connection.iceConnectionState === 'failed') {
-          setConnectionError(`Video connection to participant ${peerId} failed.`)
+
+        if (
+          connection.connectionState === 'failed' ||
+          connection.iceConnectionState === 'failed'
+        ) {
+          setConnectionError(
+            `Connection to participant ${peerId} failed.`
+          )
         } else if (connection.connectionState === 'connected') {
           setConnectionError('')
         }
       }
+
       connection.onconnectionstatechange = logConnectionState
       connection.oniceconnectionstatechange = logConnectionState
 
@@ -142,41 +311,41 @@ export function useWebRTC({ roomId, userId, participants, localStream, localScre
     [roomId, updateRemoteStream]
   )
 
-  useEffect(() => {
-    for (const peer of peersRef.current.values()) {
-      const cameraTrack =
-        localStream?.getVideoTracks().find((item) => item.readyState === 'live') || null
-      const screenTrack =
-        localScreenStream?.getVideoTracks().find((item) => item.readyState === 'live') || null
-      peer.trackUpdate = (peer.trackUpdate || Promise.resolve())
-        .then(() => Promise.all([
-          peer.cameraSender.replaceTrack(cameraTrack),
-          peer.screenSender.replaceTrack(screenTrack),
-        ]))
-        .catch((error) => {
-          console.error(`Could not update local media tracks for ${peer.userId}:`, error)
-          setConnectionError(`Could not update the media sent to participant ${peer.userId}.`)
-        })
-    }
-  }, [localScreenStream, localStream])
-
+  // Listen for WebRTC signaling messages.
   useEffect(() => {
     if (!roomId || !userId) return undefined
 
     const handleOffer = ({ fromUserId, description } = {}) => {
-      if (!fromUserId || fromUserId === userId || description?.type !== 'offer') return
-      const peer = ensurePeer(fromUserId)
+      if (
+        !fromUserId ||
+        String(fromUserId) === String(userId) ||
+        description?.type !== 'offer'
+      ) {
+        return
+      }
+
+      const peer = ensurePeer(String(fromUserId))
 
       queuePeerOperation(peer, async () => {
         if (peer.connection.signalingState !== 'stable') {
-          console.warn(`Ignoring unexpected offer from ${fromUserId}`)
+          console.warn(
+            `[WebRTC ${fromUserId}] Ignoring unexpected offer`
+          )
           return
         }
 
         await peer.connection.setRemoteDescription(description)
         await applyPendingCandidates(peer)
+
+        await syncPeerTracks(
+          peer,
+          localStreamRef.current,
+          localScreenStreamRef.current
+        )
+
         const answer = await peer.connection.createAnswer()
         await peer.connection.setLocalDescription(answer)
+
         if (socket.connected && peer.connection.localDescription) {
           socket.emit('webrtc-answer', {
             roomId,
@@ -188,59 +357,78 @@ export function useWebRTC({ roomId, userId, participants, localStream, localScre
     }
 
     const handleAnswer = ({ fromUserId, description } = {}) => {
-      if (!fromUserId || fromUserId === userId || description?.type !== 'answer') return
-      const peer = peersRef.current.get(fromUserId)
-      if (!peer) {
-        console.warn(`Received an answer from unknown participant ${fromUserId}`)
+      if (
+        !fromUserId ||
+        String(fromUserId) === String(userId) ||
+        description?.type !== 'answer'
+      ) {
         return
       }
 
+      const peer = peersRef.current.get(String(fromUserId))
+      if (!peer) return
+
       queuePeerOperation(peer, async () => {
-        if (peer.connection.signalingState !== 'have-local-offer') {
-          console.warn(`Ignoring unexpected answer from ${fromUserId}`)
+        if (
+          peer.connection.signalingState !== 'have-local-offer'
+        ) {
+          console.warn(
+            `[WebRTC ${fromUserId}] Ignoring unexpected answer`
+          )
           return
         }
+
         await peer.connection.setRemoteDescription(description)
         await applyPendingCandidates(peer)
       })
     }
 
     const handleIceCandidate = ({ fromUserId, candidate } = {}) => {
-      if (!fromUserId || fromUserId === userId || !candidate) return
-      const peer = ensurePeer(fromUserId)
+      if (
+        !fromUserId ||
+        String(fromUserId) === String(userId) ||
+        !candidate
+      ) {
+        return
+      }
+
+      const peer = ensurePeer(String(fromUserId))
 
       queuePeerOperation(peer, async () => {
         if (!peer.connection.remoteDescription) {
           peer.pendingCandidates.push(candidate)
           return
         }
+
         try {
           await peer.connection.addIceCandidate(candidate)
         } catch (error) {
-          console.error(`Could not apply ICE candidate from ${fromUserId}:`, error)
+          console.error(
+            `[WebRTC ${fromUserId}] ICE candidate error:`,
+            error
+          )
         }
       })
     }
 
-    const closeAllPeers = (clearStreams = true) => {
-      for (const peer of peersRef.current.values()) {
-        for (const { track, type, listener } of peer.remoteTrackHandlers) {
-          track.removeEventListener(type, listener)
-        }
-        peer.connection.close()
+    const closeAllPeers = () => {
+      for (const peerId of [...peersRef.current.keys()]) {
+        closePeer(peerId)
       }
-      peersRef.current.clear()
-      if (clearStreams) {
-        setRemoteCameraStreams({})
-        setRemoteScreenStreams({})
-      }
+
+      setRemoteCameraStreams({})
+      setRemoteScreenStreams({})
+      setRemoteAudioStreams({})
     }
 
     const handleDisconnect = () => {
       closeAllPeers()
       setConnectionVersion((version) => version + 1)
     }
-    const handleConnect = () => setConnectionVersion((version) => version + 1)
+
+    const handleConnect = () => {
+      setConnectionVersion((version) => version + 1)
+    }
 
     socket.on('webrtc-offer', handleOffer)
     socket.on('webrtc-answer', handleAnswer)
@@ -254,33 +442,54 @@ export function useWebRTC({ roomId, userId, participants, localStream, localScre
       socket.off('webrtc-ice-candidate', handleIceCandidate)
       socket.off('disconnect', handleDisconnect)
       socket.off('connect', handleConnect)
-      closeAllPeers(false)
-    }
-  }, [ensurePeer, roomId, userId])
 
+      closeAllPeers()
+    }
+  }, [closePeer, ensurePeer, roomId, userId])
+
+  // Create one connection for each remote participant.
   const participantIds = participants
     .map((participant) => String(participant.userId))
-    .filter((participantId) => participantId && participantId !== String(userId))
+    .filter(
+      (id) => id && id !== String(userId) && id !== 'undefined'
+    )
     .sort()
     .join(',')
 
   useEffect(() => {
     if (!roomId || !userId) return
-    const remoteIds = participantIds ? participantIds.split(',') : []
+
+    const remoteIds = participantIds
+      ? participantIds.split(',')
+      : []
+
     const activePeers = new Set(remoteIds)
 
-    for (const peerId of peersRef.current.keys()) {
-      if (!activePeers.has(peerId)) closePeer(peerId)
+    for (const peerId of [...peersRef.current.keys()]) {
+      if (!activePeers.has(peerId)) {
+        closePeer(peerId)
+      }
     }
 
     for (const peerId of remoteIds) {
       const peer = ensurePeer(peerId)
+
+      // Use a consistent initiator to avoid both sides offering at once.
       if (String(userId) < peerId && !peer.offerStarted) {
         peer.offerStarted = true
+
         queuePeerOperation(peer, async () => {
           if (peer.connection.signalingState !== 'stable') return
+
+          await syncPeerTracks(
+            peer,
+            localStreamRef.current,
+            localScreenStreamRef.current
+          )
+
           const offer = await peer.connection.createOffer()
           await peer.connection.setLocalDescription(offer)
+
           if (socket.connected && peer.connection.localDescription) {
             socket.emit('webrtc-offer', {
               roomId,
@@ -291,7 +500,19 @@ export function useWebRTC({ roomId, userId, participants, localStream, localScre
         })
       }
     }
-  }, [closePeer, connectionVersion, ensurePeer, participantIds, roomId, userId])
+  }, [
+    closePeer,
+    connectionVersion,
+    ensurePeer,
+    participantIds,
+    roomId,
+    userId,
+  ])
 
-  return { remoteCameraStreams, remoteScreenStreams, connectionError }
+  return {
+    remoteCameraStreams,
+    remoteScreenStreams,
+    remoteAudioStreams,
+    connectionError,
+  }
 }
