@@ -36,24 +36,20 @@ function getLiveTrack(stream, kind) {
   )
 }
 
-// Synchronize local camera, microphone, and screen tracks.
+// Update outgoing tracks and log exactly what WebRTC is sending.
 function syncPeerTracks(peer, cameraStream, screenStream) {
   const cameraTrack = getLiveTrack(cameraStream, 'video')
   const audioTrack = getLiveTrack(cameraStream, 'audio')
   const screenTrack = getLiveTrack(screenStream, 'video')
 
-  console.info(
-    `[WebRTC ${peer.userId}] Sending media:`,
-    JSON.stringify({
-      cameraTrack: cameraTrack?.readyState ?? 'missing',
-      audioTrack: audioTrack?.readyState ?? 'missing',
-      screenTrack: screenTrack?.readyState ?? 'missing',
-      screenTrackId: screenTrack?.id ?? 'missing',
-      connectionState: peer.connection.connectionState,
-      signalingState: peer.connection.signalingState,
-      screenMid: peer.screenTransceiver.mid,
-    })
-  )
+  console.log(`[WebRTC ${peer.userId}] Sending media`, {
+    cameraTrack: cameraTrack?.readyState ?? 'missing',
+    audioTrack: audioTrack?.readyState ?? 'missing',
+    screenTrack: screenTrack?.readyState ?? 'missing',
+    screenTrackId: screenTrack?.id ?? 'missing',
+    connectionState: peer.connection.connectionState,
+    signalingState: peer.connection.signalingState,
+  })
 
   peer.trackUpdate = (peer.trackUpdate || Promise.resolve())
     .then(async () => {
@@ -65,19 +61,14 @@ function syncPeerTracks(peer, cameraStream, screenStream) {
         peer.screenSender.replaceTrack(screenTrack),
       ])
 
-      console.info(
-        `[WebRTC ${peer.userId}] Tracks attached:`,
-        JSON.stringify({
-          cameraTrack: peer.cameraSender.track?.id ?? 'missing',
-          audioTrack: peer.audioSender.track?.id ?? 'missing',
-          outgoingScreenTrack: peer.screenSender.track?.id ?? 'missing',
-          screenTrackState:
-            peer.screenSender.track?.readyState ?? 'missing',
-          screenTrackEnabled: peer.screenSender.track?.enabled ?? false,
-          screenMid: peer.screenTransceiver.mid,
-          signalingState: peer.connection.signalingState,
-        })
-      )
+      console.log(`[WebRTC ${peer.userId}] Tracks attached`, {
+        cameraTrack: peer.cameraSender.track?.id ?? 'missing',
+        audioTrack: peer.audioSender.track?.id ?? 'missing',
+        outgoingScreenTrack: peer.screenSender.track?.id ?? 'missing',
+        screenTrackState:
+          peer.screenSender.track?.readyState ?? 'missing',
+        screenTrackEnabled: peer.screenSender.track?.enabled ?? false,
+      })
     })
     .catch((error) => {
       console.error(
@@ -301,24 +292,14 @@ export function useWebRTC({
 
         showStream()
 
-        // Print actual values instead of a collapsed console Object.
-        console.info(
-          `[WebRTC ${peerId}] Received ${kind} track:`,
-          JSON.stringify({
-            trackKind: event.track.kind,
-            trackId: event.track.id,
-            readyState: event.track.readyState,
-            muted: event.track.muted,
-            transceiverMid: event.transceiver.mid,
-            screenTransceiverMid: peer.screenTransceiver.mid,
-            isScreenTransceiver:
-              event.transceiver === peer.screenTransceiver,
-            transceiverDirection: event.transceiver.direction,
-            currentDirection: event.transceiver.currentDirection,
-            streamCount: event.streams?.length ?? 0,
-            streamIds: event.streams?.map((stream) => stream.id) ?? [],
-          })
-        )
+        console.info(`[WebRTC ${peerId}] Received ${kind} track`, {
+          trackKind: event.track.kind,
+          readyState: event.track.readyState,
+          muted: event.track.muted,
+          transceiverMid: event.transceiver.mid,
+          screenTransceiverMid: peer.screenTransceiver.mid,
+          streamCount: event.streams?.length ?? 0,
+        })
       }
 
       const logConnectionState = () => {
@@ -346,7 +327,7 @@ export function useWebRTC({
     [roomId, updateRemoteStream]
   )
 
-  // Listen for offers, answers, and ICE candidates.
+  // Listen for offers, answers and ICE candidates.
   useEffect(() => {
     if (!roomId || !userId) return undefined
 
@@ -358,14 +339,6 @@ export function useWebRTC({
       ) {
         return
       }
-
-      console.info(
-        `[WebRTC ${fromUserId}] Received offer`,
-        JSON.stringify({
-          type: description.type,
-          hasSdp: Boolean(description.sdp),
-        })
-      )
 
       const peer = ensurePeer(String(fromUserId))
 
@@ -395,8 +368,6 @@ export function useWebRTC({
             targetUserId: fromUserId,
             description: peer.connection.localDescription,
           })
-
-          console.info(`[WebRTC ${fromUserId}] Sent answer`)
         }
       })
     }
@@ -411,26 +382,20 @@ export function useWebRTC({
       }
 
       const peer = peersRef.current.get(String(fromUserId))
-      if (!peer) {
-        console.warn(
-          `[WebRTC ${fromUserId}] Answer received without a peer`
-        )
-        return
-      }
+      if (!peer) return
 
       queuePeerOperation(peer, async () => {
-        if (peer.connection.signalingState !== 'have-local-offer') {
+        if (
+          peer.connection.signalingState !== 'have-local-offer'
+        ) {
           console.warn(
-            `[WebRTC ${fromUserId}] Ignoring unexpected answer`,
-            peer.connection.signalingState
+            `[WebRTC ${fromUserId}] Ignoring unexpected answer`
           )
           return
         }
 
         await peer.connection.setRemoteDescription(description)
         await applyPendingCandidates(peer)
-
-        console.info(`[WebRTC ${fromUserId}] Answer applied`)
       })
     }
 
@@ -546,8 +511,6 @@ export function useWebRTC({
               targetUserId: peerId,
               description: peer.connection.localDescription,
             })
-
-            console.info(`[WebRTC ${peerId}] Sent offer`)
           }
         })
       }
