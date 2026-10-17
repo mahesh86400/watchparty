@@ -36,20 +36,10 @@ function getLiveTrack(stream, kind) {
   )
 }
 
-// Update outgoing tracks and log exactly what WebRTC is sending.
 function syncPeerTracks(peer, cameraStream, screenStream) {
   const cameraTrack = getLiveTrack(cameraStream, 'video')
   const audioTrack = getLiveTrack(cameraStream, 'audio')
   const screenTrack = getLiveTrack(screenStream, 'video')
-
-  console.log(`[WebRTC ${peer.userId}] Sending media`, {
-    cameraTrack: cameraTrack?.readyState ?? 'missing',
-    audioTrack: audioTrack?.readyState ?? 'missing',
-    screenTrack: screenTrack?.readyState ?? 'missing',
-    screenTrackId: screenTrack?.id ?? 'missing',
-    connectionState: peer.connection.connectionState,
-    signalingState: peer.connection.signalingState,
-  })
 
   peer.trackUpdate = (peer.trackUpdate || Promise.resolve())
     .then(async () => {
@@ -60,15 +50,6 @@ function syncPeerTracks(peer, cameraStream, screenStream) {
         peer.audioSender.replaceTrack(audioTrack),
         peer.screenSender.replaceTrack(screenTrack),
       ])
-
-      console.log(`[WebRTC ${peer.userId}] Tracks attached`, {
-        cameraTrack: peer.cameraSender.track?.id ?? 'missing',
-        audioTrack: peer.audioSender.track?.id ?? 'missing',
-        outgoingScreenTrack: peer.screenSender.track?.id ?? 'missing',
-        screenTrackState:
-          peer.screenSender.track?.readyState ?? 'missing',
-        screenTrackEnabled: peer.screenSender.track?.enabled ?? false,
-      })
     })
     .catch((error) => {
       console.error(
@@ -97,6 +78,7 @@ export function useWebRTC({
   const localStreamRef = useRef(localStream)
   const localScreenStreamRef = useRef(localScreenStream)
 
+  // Keep the latest local streams available to every peer.
   useEffect(() => {
     localStreamRef.current = localStream
     localScreenStreamRef.current = localScreenStream
@@ -136,6 +118,7 @@ export function useWebRTC({
       const peer = peersRef.current.get(peerId)
       if (!peer) return
 
+      // Remove it first so old track callbacks cannot update the UI.
       peersRef.current.delete(peerId)
 
       peer.connection.onicecandidate = null
@@ -152,8 +135,6 @@ export function useWebRTC({
       updateRemoteStream(peerId, 'camera', null)
       updateRemoteStream(peerId, 'screen', null)
       updateRemoteStream(peerId, 'audio', null)
-
-      console.info(`[WebRTC ${peerId}] Peer connection closed`)
     },
     [updateRemoteStream]
   )
@@ -185,6 +166,7 @@ export function useWebRTC({
             direction: 'sendrecv',
           }).sender
 
+      // Reserve an audio sender even when the microphone is not ready yet.
       const audioSender = connection.addTransceiver('audio', {
         direction: 'sendrecv',
       }).sender
@@ -218,6 +200,7 @@ export function useWebRTC({
 
       peersRef.current.set(peerId, peer)
 
+      // Attach the latest camera, microphone and screen tracks.
       void syncPeerTracks(
         peer,
         localStreamRef.current,
@@ -247,6 +230,7 @@ export function useWebRTC({
           kind = 'camera'
         }
 
+        // Keep audio separate so WatchRoom can play it with an audio element.
         const remoteStream =
           kind === 'audio'
             ? new MediaStream([event.track])
@@ -255,11 +239,13 @@ export function useWebRTC({
 
         const showStream = () => {
           if (peersRef.current.get(peerId) !== peer) return
+
           updateRemoteStream(peerId, kind, remoteStream)
         }
 
         const hideStream = () => {
           if (peersRef.current.get(peerId) !== peer) return
+
           updateRemoteStream(peerId, kind, null)
         }
 
@@ -296,15 +282,13 @@ export function useWebRTC({
           trackKind: event.track.kind,
           readyState: event.track.readyState,
           muted: event.track.muted,
-          transceiverMid: event.transceiver.mid,
-          screenTransceiverMid: peer.screenTransceiver.mid,
           streamCount: event.streams?.length ?? 0,
         })
       }
 
       const logConnectionState = () => {
         console.info(
-          `[WebRTC ${peerId}] connectionState=${connection.connectionState}, iceConnectionState=${connection.iceConnectionState}, signalingState=${connection.signalingState}`
+          `[WebRTC ${peerId}] connectionState=${connection.connectionState}, iceConnectionState=${connection.iceConnectionState}`
         )
 
         if (
@@ -327,7 +311,7 @@ export function useWebRTC({
     [roomId, updateRemoteStream]
   )
 
-  // Listen for offers, answers and ICE candidates.
+  // Listen for WebRTC signaling messages.
   useEffect(() => {
     if (!roomId || !userId) return undefined
 
@@ -463,7 +447,7 @@ export function useWebRTC({
     }
   }, [closePeer, ensurePeer, roomId, userId])
 
-  // Maintain one peer connection per other participant.
+  // Create one connection for each remote participant.
   const participantIds = participants
     .map((participant) => String(participant.userId))
     .filter(
@@ -490,6 +474,7 @@ export function useWebRTC({
     for (const peerId of remoteIds) {
       const peer = ensurePeer(peerId)
 
+      // Use a consistent initiator to avoid both sides offering at once.
       if (String(userId) < peerId && !peer.offerStarted) {
         peer.offerStarted = true
 
